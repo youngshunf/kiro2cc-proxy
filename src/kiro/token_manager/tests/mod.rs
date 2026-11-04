@@ -5,6 +5,8 @@ mod credentials;
 mod ext_idp;
 mod model_routing;
 mod multi;
+#[path = "../../../../tests/kiro/opus_model_routing.rs"]
+mod opus_model_routing;
 mod recovery;
 mod refresh;
 mod region;

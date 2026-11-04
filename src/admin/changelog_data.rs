@@ -67,6 +67,14 @@ const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub fn build_release_notes() -> Vec<ReleaseNote> {
     let mut notes = vec![
         ReleaseNote {
+            version: "3.5.1-astra.1".to_string(),
+            is_latest: false,
+            groups: vec![fix_group(vec![Bilingual::new(
+                "修复 Opus 账号调度：实时模型列表优先于订阅名称，单账号也会探测模型能力；保留白名单、禁用与会话粘性约束",
+                "Route Opus using live model capabilities before subscription labels, including single-account pools, while preserving account restrictions and sticky sessions",
+            )])],
+        },
+        ReleaseNote {
             version: "3.5.1".to_string(),
             is_latest: false,
             groups: vec![

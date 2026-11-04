@@ -7,10 +7,12 @@
 //! # 设计取舍：宁可不过滤，也不误排除
 //! - 探测结果只有「明确不含该模型」才算不支持；探测失败、返回空列表、缓存过期、
 //!   `auto` 等都视为「未知」，照常参与调度。
-//! - 即使有账号明确不支持，只要候选里有支持者或未知者就排除它们；
+//! - 对非 Opus 模型，即使有账号明确不支持，只要候选里有支持者或未知者就排除它们；
 //!   候选全部「明确不支持」时不过滤（上游列表可能不完整，例如新模型尚未出现在列表里，
 //!   此时保持与引入本功能前一致的行为）。
 //! - 探测失败不会禁用账号，也不计入失败次数。
+//! - Opus 资格以新鲜的非空实时模型集合为准；能力未知时才沿用订阅名称判断。
+//!   单账号同样需要探测，避免实时支持被 Free 订阅名称错误覆盖。
 //!
 //! # 探测不拖慢请求
 //! 探测在独立后台任务里执行，请求最多等待 `MODEL_SUPPORT_MAX_WAIT`：稳态（缓存新鲜）
@@ -36,6 +38,25 @@ fn is_unfilterable_model(model: &str) -> bool {
 }
 
 impl MultiTokenManager {
+    /// 统一 Opus 调度资格，实时能力未知时保留原有订阅回退规则。
+    ///
+    /// 可在持有 entries 锁时调用，model_support 保持为叶子锁。
+    pub(crate) fn is_opus_eligible(&self, entry: &CredentialEntry, model: Option<&str>) -> bool {
+        let Some(model) = model.filter(|model| model.to_ascii_lowercase().contains("opus")) else {
+            return true;
+        };
+        let cache = self.model_support.lock();
+        match cache
+            .get(&entry.id)
+            .filter(|support| support.is_fresh())
+            .and_then(|support| support.models.as_ref())
+            .filter(|models| !models.is_empty())
+        {
+            Some(models) => models.contains(&model.to_ascii_lowercase()),
+            None => entry.credentials.supports_opus(),
+        }
+    }
+
     /// 账号是否「明确不支持」该模型（探测结果有效且不含该模型）
     ///
     /// 探测结果缺失、过期、失败时返回 `false`（未知）。
@@ -101,7 +122,7 @@ impl MultiTokenManager {
 
     /// 需要探测的账号：范围内、可调度（未禁用且非 Unhealthy）、探测结果缺失或过期
     ///
-    /// 范围内可调度账号不足 2 个时没有路由可言，返回空。
+    /// 单账号池也需要能力结果，以免订阅名称错误覆盖实时支持情况。
     pub(crate) fn model_support_probe_targets(&self, allowed_ids: &[u64]) -> Vec<u64> {
         let schedulable: Vec<u64> = {
             let entries = self.entries.lock();
@@ -117,9 +138,6 @@ impl MultiTokenManager {
                 .map(|e| e.id)
                 .collect()
         };
-        if schedulable.len() < 2 {
-            return Vec::new();
-        }
         let cache = self.model_support.lock();
         schedulable
             .into_iter()

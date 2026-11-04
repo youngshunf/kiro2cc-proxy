@@ -1,0 +1,17 @@
+# 构建上下文仅放已验证的 Linux amd64 二进制，不包含运行配置或凭据。
+FROM debian:bookworm-slim@sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates libssl3 wget \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG SOURCE_REVISION
+ARG RELEASE_VERSION
+LABEL org.opencontainers.image.source="https://github.com/youngshunf/kiro2cc-proxy" \
+      org.opencontainers.image.revision="${SOURCE_REVISION}" \
+      org.opencontainers.image.version="${RELEASE_VERSION}"
+
+WORKDIR /app
+COPY kiro2cc-proxy /app/kiro2cc-proxy
+EXPOSE 5678
+CMD ["/app/kiro2cc-proxy", "--config", "/app/config/config.json", "--credentials", "/app/config/credentials.json"]

@@ -6,7 +6,6 @@
 /test.json
 /web-ui/admin-ui/node_modules/
 /web-ui/admin-ui/dist/
-/web-ui/admin-ui/pnpm-lock.yaml
 /web-ui/admin-ui/package-lock.json
 /web-ui/admin-ui/tsconfig.tsbuildinfo
 /credentials.*
@@ -18,7 +17,6 @@
 /web-ui/user-ui/node_modules/
 /web-ui/user-ui/dist/
 /web-ui/user-ui/tsconfig.tsbuildinfo
-/web-ui/user-ui/pnpm-lock.yaml
 /web-ui/user-ui/package-lock.json
 
 # Runtime files

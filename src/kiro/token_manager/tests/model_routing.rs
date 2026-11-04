@@ -162,8 +162,8 @@ mod tests {
     }
 
     #[test]
-    fn probe_targets_skip_single_account_pool_and_fresh_results() {
-        // 单账号池：没有路由可言，不探测
+    fn probe_targets_include_single_account_pool_and_skip_fresh_results() {
+        // 单账号池同样需要实时能力，不能只凭订阅名称判断模型支持情况。
         let single = MultiTokenManager::new(
             Config::default(),
             vec![make_valid_cred("t1")],
@@ -172,7 +172,7 @@ mod tests {
             false,
         )
         .unwrap();
-        assert!(single.model_support_probe_targets(&[]).is_empty());
+        assert_eq!(single.model_support_probe_targets(&[]), vec![1]);
 
         let m = manager_with_two();
         assert_eq!(m.model_support_probe_targets(&[]), vec![1, 2]);
@@ -198,11 +198,11 @@ mod tests {
     #[test]
     fn probe_targets_exclude_disabled_accounts_and_honor_whitelist() {
         let m = manager_with_two();
-        // 白名单只有 1 个账号：同样没有路由可言
-        assert!(m.model_support_probe_targets(&[1]).is_empty());
+        // 白名单只有 1 个账号时仍探测，但不得扩大到白名单外。
+        assert_eq!(m.model_support_probe_targets(&[1]), vec![1]);
         // 禁用其中一个后只剩 1 个可调度账号
         m.entries.lock()[1].disabled = true;
-        assert!(m.model_support_probe_targets(&[]).is_empty());
+        assert_eq!(m.model_support_probe_targets(&[]), vec![1]);
     }
 
     fn resp(ids: &[&str]) -> AvailableModelsResponse {
