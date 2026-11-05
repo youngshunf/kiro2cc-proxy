@@ -69,10 +69,7 @@ pub struct CredentialRangeSummary {
     pub total_cache_read_tokens: u64,
 }
 
-/// 指定账号全部留存记录（受 MAX_RECORDS_PER_KEY 裁剪约束）的用量汇总
-///
-/// 与该页「总请求数」同口径：只统计当前仍留在明细缓冲里的记录，
-/// 不含已被裁剪的历史。费用为估算 USD，Credits 真实用量优先、缺失按模型回退估算。
+/// 指定账号的累计用量汇总，包含已经清理的明细贡献。
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CredentialUsageSummary {
@@ -89,7 +86,7 @@ pub struct CredentialUsageSummary {
 }
 
 impl UsageTracker {
-    /// 按账号聚合全部留存记录（不限日期）。
+    /// 按账号聚合累计用量（不限日期，保留已清理部分）。
     ///
     /// 无记录时返回零值汇总（不报错），与 `get_today_summary_for_credential` 一致。
     pub fn get_summary_for_credential(&self, credential_id: u64) -> CredentialUsageSummary {
@@ -119,15 +116,21 @@ impl UsageTracker {
             }
         }
 
+        let lifetime = self
+            .lifetime_credentials
+            .read()
+            .get(&credential_id)
+            .cloned()
+            .unwrap_or_default();
         CredentialUsageSummary {
             credential_id,
-            total_requests: requests,
-            total_input_tokens: input_tokens,
-            total_output_tokens: output_tokens,
-            total_cache_read_tokens: cache_read_tokens,
-            total_cost: cost,
-            total_credits: credits,
-            total_credits_saved: credits_saved,
+            total_requests: requests + lifetime.pruned_requests,
+            total_input_tokens: input_tokens + lifetime.pruned_positive_input_tokens,
+            total_output_tokens: output_tokens + lifetime.pruned_positive_output_tokens,
+            total_cache_read_tokens: cache_read_tokens + lifetime.pruned_cache_read_tokens,
+            total_cost: cost + lifetime.pruned_cost,
+            total_credits: credits + lifetime.pruned_credits,
+            total_credits_saved: credits_saved + lifetime.pruned_credits_saved,
         }
     }
 

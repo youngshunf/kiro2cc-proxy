@@ -748,30 +748,24 @@ mod tests {
             // 等待后台任务把脏数据落盘（周期 5s 太长，直接触发 shutdown 刷盘：
             // drop tracker 即关闭通道，graceful shutdown 分支会执行落盘）
         }
-        // 轮询等待刷盘完成。不能仅等基数文件存在：后台先处理 interval tick 时
-        // （局部 dirty 尚为 false）可能只写基数、不写明细，此时明细文件可能
-        // 还未就绪；改为等待明细文件落盘且记录数达到上限，配合基数文件存在的
-        // 前置条件，两者都就绪才认为 shutdown 刷盘完成
-        let lifetime_path = path.parent().unwrap().join("api_key_lifetime.json");
+        // 明细与累计基数来自同一个已落盘快照，不能只等待文件出现。
         let mut persisted = false;
         for _ in 0..100 {
-            let records_ready = std::fs::read_to_string(&path)
-                .map(|c| {
-                    serde_json::from_str::<Vec<crate::model::usage::UsageRecord>>(&c)
-                        .map(|r| r.len() == crate::model::usage::MAX_RECORDS_PER_KEY_FOR_TEST)
-                        .unwrap_or(false)
-                })
-                .unwrap_or(false);
-            if records_ready && lifetime_path.exists() {
-                persisted = true;
+            persisted = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|c| serde_json::from_str::<super::super::UsageSnapshot>(&c).ok())
+                .is_some_and(|s| {
+                    s.records.len() == crate::model::usage::MAX_RECORDS_PER_KEY_FOR_TEST
+                        && s.lifetime_keys
+                            .get(&7)
+                            .is_some_and(|t| t.pruned_requests == 7)
+                });
+            if persisted {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
-        assert!(
-            persisted,
-            "lifetime base file should be written on shutdown"
-        );
+        assert!(persisted, "退出时明细和累计基数应完整落入同一快照");
         let tracker2 = UsageTracker::load(&path).unwrap();
         // 精确断言：明细（上限条）+ 基数（裁剪掉的 7 条）完整持久化，
         // 基数文件缺失或仅靠现存明细求和都会在此失败

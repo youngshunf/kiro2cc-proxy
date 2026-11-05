@@ -10,9 +10,8 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::mpsc;
 
 /// 单条用量记录
@@ -133,6 +132,8 @@ pub struct ModelUsage {
 }
 /// 每个 API Key / 账号的最大日志条数，超出时删除最老的记录
 const MAX_RECORDS_PER_KEY: usize = 10_000;
+/// 明细保留最近 30 天，累计用量不随清理减少。
+const RETENTION_DAYS: i64 = 30;
 /// 测试专用再导出（tests.rs 为独立文件，需经模块路径访问私有常量）
 #[cfg(test)]
 pub(crate) const MAX_RECORDS_PER_KEY_FOR_TEST: usize = MAX_RECORDS_PER_KEY;
@@ -144,7 +145,7 @@ pub(crate) const MAX_RECORDS_PER_KEY_FOR_TEST: usize = MAX_RECORDS_PER_KEY;
 /// 删记录的贡献累加进此处的「裁剪前基数」，使
 /// `裁剪前基数 + 现存记录求和` 恒等于真实累计值。
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(default, rename_all = "camelCase")]
 struct LifetimeTotals {
     /// 裁剪掉的记录贡献的请求数（已从明细缓冲删除，只能从这里取）
     pruned_requests: u64,
@@ -152,209 +153,234 @@ struct LifetimeTotals {
     pruned_input_tokens: i64,
     /// 裁剪掉的记录贡献的输出 tokens
     pruned_output_tokens: i64,
+    pruned_cost: f64,
+    pruned_credits: f64,
+    pruned_credits_saved: f64,
+    pruned_cache_read_tokens: u64,
+    pruned_positive_input_tokens: u64,
+    pruned_positive_output_tokens: u64,
+    by_model: HashMap<String, ModelUsage>,
 }
 
-impl std::ops::AddAssign for LifetimeTotals {
-    fn add_assign(&mut self, rhs: Self) {
-        self.pruned_requests += rhs.pruned_requests;
-        self.pruned_input_tokens += rhs.pruned_input_tokens;
-        self.pruned_output_tokens += rhs.pruned_output_tokens;
+impl LifetimeTotals {
+    fn add_record(&mut self, record: &UsageRecord) {
+        let credits = record
+            .credits_used
+            .unwrap_or_else(|| record.estimated_cost * get_k_ref(&record.model));
+        let saved = record.credits_used.map_or(0.0, |cu| {
+            record.estimated_cost * get_k_ref(&record.model) - cu
+        });
+        self.pruned_requests += 1;
+        self.pruned_input_tokens += i64::from(record.input_tokens);
+        self.pruned_output_tokens += i64::from(record.output_tokens);
+        self.pruned_positive_input_tokens += record.input_tokens.max(0) as u64;
+        self.pruned_positive_output_tokens += record.output_tokens.max(0) as u64;
+        self.pruned_cost += record.estimated_cost;
+        self.pruned_credits += credits;
+        self.pruned_credits_saved += saved;
+        self.pruned_cache_read_tokens += record.cache_read_input_tokens.unwrap_or(0).max(0) as u64;
+        let model = self
+            .by_model
+            .entry(record.model.clone())
+            .or_insert_with(|| ModelUsage {
+                model: record.model.clone(),
+                requests: 0,
+                input_tokens: 0,
+                output_tokens: 0,
+                cost: 0.0,
+                credits: 0.0,
+                credits_saved: 0.0,
+            });
+        model.requests += 1;
+        model.input_tokens += i64::from(record.input_tokens);
+        model.output_tokens += i64::from(record.output_tokens);
+        model.cost += record.estimated_cost;
+        model.credits += credits;
+        model.credits_saved += saved;
     }
 }
 
-/// 累计计数文件路径：与用量文件同目录的 `api_key_lifetime.json`
-fn lifetime_path_for(usage_path: &Path) -> Option<PathBuf> {
-    usage_path.parent().map(|d| d.join("api_key_lifetime.json"))
+/// 明细和累计基数必须来自同一次快照，避免两份文件分别成功导致重复或漏计。
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UsageSnapshot {
+    format_version: u32,
+    records: Vec<UsageRecord>,
+    lifetime_keys: HashMap<u32, LifetimeTotals>,
+    lifetime_credentials: HashMap<u64, LifetimeTotals>,
 }
+
+enum UsageData {
+    Legacy(Vec<UsageRecord>),
+    Snapshot(UsageSnapshot),
+}
+
+type LifetimeMap<T> = Arc<RwLock<HashMap<T, LifetimeTotals>>>;
 
 /// 用量追踪器（线程安全）
 pub struct UsageTracker {
     pub(crate) records: Arc<RwLock<Vec<UsageRecord>>>,
-
     pub(crate) dirty_tx: mpsc::UnboundedSender<()>,
-
-    /// 生命周期累计（裁剪前基数），按 api_key_id 分组
-    lifetime_keys: Arc<RwLock<HashMap<u32, LifetimeTotals>>>,
-    /// 生命周期累计（裁剪前基数），按 credential_id 分组
-    lifetime_credentials: Arc<RwLock<HashMap<u64, LifetimeTotals>>>,
-    /// 累计计数落盘路径（仅后台任务持有；None = 记忆态，如测试场景）
-    #[allow(dead_code)]
-    lifetime_path: Option<PathBuf>,
-    /// 累计计数脏标记：仅裁剪发生（基数变化）时置位，由后台任务周期落盘
-    lifetime_dirty: Arc<AtomicBool>,
+    lifetime_keys: LifetimeMap<u32>,
+    lifetime_credentials: LifetimeMap<u64>,
 }
 
 impl UsageTracker {
-    /// 从文件加载，文件不存在则创建空列表
+    /// 读取新快照或旧数组，旧累计文件只在迁移时读取，损坏数据显式报错。
     pub fn load<P: AsRef<Path>>(path: P) -> anyhow::Result<Self> {
         let path = path.as_ref().to_path_buf();
-        let records = if path.exists() {
-            let content = fs::read_to_string(&path)?;
-            if content.trim().is_empty() {
-                Vec::new()
-            } else {
-                serde_json::from_str(&content)?
-            }
-        } else {
-            Vec::new()
-        };
-        let records = Arc::new(RwLock::new(records));
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let lifetime_dirty = Arc::new(AtomicBool::new(false));
-        let lifetime_dirty_clone = lifetime_dirty.clone();
-        let records_clone = records.clone();
-        let path_clone = path.clone();
-        // 以现存明细为基数迁移。迁移只发生在文件缺失时 —— 文件存在即以文件为准，
-        // 保证重启幂等。token 基数迁移为 0：明细裁剪从部署升级后才计入，
-        // 请求数优先修复（token 侧误差仅剩「升级前已裁剪的部分」，不可恢复）。
-        let lifetime_path = lifetime_path_for(&path);
-        let (lifetime_keys, lifetime_credentials) = match &lifetime_path {
-            Some(p) if p.exists() => {
-                // 文件存在但不可读/不可解析时向上传播错误，禁止以零基数启动：
-                // 静默归零后一旦再发生裁剪，会把小基数写回并覆盖历史累计量
-                let content = fs::read_to_string(p)?;
-                match serde_json::from_str::<HashMap<String, LifetimeTotals>>(&content) {
-                    // 文件存在但为空：零基数起步（现存明细仍由 get_summary
-                    // 现存求和计入，基数若也计现存记录会导致请求数翻倍）
-                    Ok(raw) if raw.is_empty() || content.trim().is_empty() => {
-                        (HashMap::new(), HashMap::new())
-                    }
-                    Ok(raw) if !raw.is_empty() => {
-                        let keys = raw
-                            .iter()
-                            .filter_map(|(k, v)| k.parse::<u32>().ok().map(|id| (id, v.clone())))
-                            .collect::<HashMap<_, _>>();
-                        // credential 与 key 共用同一文件，键空间可能重叠（如 key #3
-                        // 与 credential #3）；当前 credential 侧仅内存态，不落盘恢复
-                        (keys, HashMap::new())
-                    }
-                    // 文件存在但格式损坏：向上传播错误，禁止以零基数启动（同上）
-                    Err(e) => {
-                        return Err(anyhow::anyhow!(
-                            "解析累计基数文件 {} 失败: {}",
-                            p.display(),
-                            e
-                        ));
-                    }
-                    Ok(_) => (HashMap::new(), HashMap::new()),
+        let data = match fs::read_to_string(&path) {
+            Ok(content) if !content.trim().is_empty() => {
+                if content.trim_start().starts_with('[') {
+                    UsageData::Legacy(serde_json::from_str(&content)?)
+                } else {
+                    UsageData::Snapshot(serde_json::from_str(&content)?)
                 }
             }
-            // 存量部署首次升级：零基数迁移（同上，现存记录由明细求和计入）
-            _ => (HashMap::new(), HashMap::new()),
+            Ok(_) => UsageData::Legacy(Vec::new()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => UsageData::Legacy(Vec::new()),
+            Err(e) => return Err(e.into()),
         };
+        let (records, lifetime_keys, lifetime_credentials, migrating) = match data {
+            UsageData::Snapshot(snapshot) => {
+                anyhow::ensure!(
+                    snapshot.format_version == 1,
+                    "不支持的用量快照版本: {}",
+                    snapshot.format_version
+                );
+                (
+                    snapshot.records,
+                    snapshot.lifetime_keys,
+                    snapshot.lifetime_credentials,
+                    false,
+                )
+            }
+            UsageData::Legacy(records) => {
+                let lifetime_path = path.with_file_name("api_key_lifetime.json");
+                let keys = match fs::read_to_string(&lifetime_path) {
+                    Ok(content) => serde_json::from_str(&content)?,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
+                    Err(e) => return Err(e.into()),
+                };
+                (records, keys, HashMap::new(), true)
+            }
+        };
+        let records = Arc::new(RwLock::new(records));
         let lifetime_keys = Arc::new(RwLock::new(lifetime_keys));
         let lifetime_credentials = Arc::new(RwLock::new(lifetime_credentials));
-        let lifetime_keys_task = lifetime_keys.clone();
-        let lifetime_credentials_task = lifetime_credentials.clone();
-        let lifetime_path_task = lifetime_path.clone();
-
-        // 启动后台异步写入任务，避免同步文件写阻塞请求线程
+        let removed =
+            Self::prune_expired(&records, &lifetime_keys, &lifetime_credentials, Utc::now());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let records_task = records.clone();
+        let keys_task = lifetime_keys.clone();
+        let credentials_task = lifetime_credentials.clone();
         tokio::spawn(async move {
-            let lifetime_keys = lifetime_keys_task;
-            let lifetime_credentials = lifetime_credentials_task;
-            let lifetime_path = lifetime_path_task;
-            let mut dirty = false;
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+            let mut dirty = migrating || removed > 0;
+            let mut flush = tokio::time::interval(std::time::Duration::from_secs(5));
+            let mut maintenance = tokio::time::interval(std::time::Duration::from_secs(3600));
             loop {
                 tokio::select! {
-                    res = rx.recv() => {
-                        match res {
-                            Some(_) => dirty = true,
+                    res = rx.recv() => match res {
+                        Some(()) => dirty = true,
                         None => {
-                                // 通道已关闭（系统退出），执行 Graceful Shutdown 刷盘
-                                if dirty
-                                    && let Err(e) = Self::save_internal(&records_clone, &path_clone).await {
-                                        tracing::error!("Graceful shutdown usage save failed: {}", e);
-                                    }
-                                if lifetime_dirty.swap(false, Ordering::Relaxed)
-                                    && let Err(e) = Self::save_lifetime_internal(
-                                        &lifetime_keys, &lifetime_credentials, &lifetime_path,
-                                    ).await
-                                {
-                                    tracing::error!("Graceful shutdown lifetime save failed: {}", e);
-                                }
-                                break;
+                            if dirty && let Err(e) = Self::save_internal(&records_task, &keys_task, &credentials_task, &path).await {
+                                tracing::error!("退出时保存用量快照失败: {}", e);
                             }
+                            break;
                         }
+                    },
+                    _ = maintenance.tick() => {
+                        dirty |= Self::prune_expired(&records_task, &keys_task, &credentials_task, Utc::now()) > 0;
                     }
-                    _ = interval.tick() => {
-                        // 明细刷盘成功才清 dirty，失败则下个周期重试
+                    _ = flush.tick() => {
                         if dirty {
-                            if let Err(e) = Self::save_internal(&records_clone, &path_clone).await {
-                                tracing::error!("Failed to save usage: {}", e);
-                            } else {
-                                dirty = false;
+                            match Self::save_internal(&records_task, &keys_task, &credentials_task, &path).await {
+                                Ok(()) => dirty = false,
+                                Err(e) => tracing::warn!("保存用量快照失败，下一周期重试: {}", e),
                             }
-                        }
-                        // 累计计数仅在发生裁剪（基数变化）时落盘，独立于明细 dirty：
-                        // 明细长时间无新增时基数变化也要能落盘；写盘失败恢复脏标记，
-                        // 由下个周期重试（否则该次基数变化将永久丢失）
-                        if lifetime_dirty.swap(false, Ordering::Relaxed)
-                            && let Err(e) = Self::save_lifetime_internal(
-                                &lifetime_keys, &lifetime_credentials, &lifetime_path,
-                            ).await
-                        {
-                            lifetime_dirty.store(true, Ordering::Relaxed);
-                            tracing::error!("Failed to save lifetime totals: {}", e);
                         }
                     }
                 }
             }
         });
-
         Ok(Self {
             records,
-
             dirty_tx: tx,
             lifetime_keys,
             lifetime_credentials,
-            lifetime_path,
-            lifetime_dirty: lifetime_dirty_clone,
         })
     }
 
-    /// 生命周期累计落盘（异步）：仅记录裁剪前基数，不含现存明细
-    async fn save_lifetime_internal(
-        lifetime_keys: &Arc<RwLock<HashMap<u32, LifetimeTotals>>>,
-        _lifetime_credentials: &Arc<RwLock<HashMap<u64, LifetimeTotals>>>,
-        path: &Option<PathBuf>,
-    ) -> anyhow::Result<()> {
-        let Some(path) = path else {
-            return Ok(());
-        };
-        // JSON 对象键不支持数字，存为 str(id)；credential 侧暂不落盘
-        // （credential 仅用于账号维度统计，key 侧请求数才是 UI 展示口径）
-        let map = lifetime_keys.read().clone();
-        let raw: HashMap<String, LifetimeTotals> =
-            map.into_iter().map(|(id, v)| (id.to_string(), v)).collect();
-        let content = serde_json::to_string(&raw)?;
-        let path = path.clone();
-        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent)?;
+    /// 顺序固定为明细、Key 基数、账号基数，清理和保存共用这一锁序。
+    fn retain_records(
+        records: &mut Vec<UsageRecord>,
+        keys: &mut HashMap<u32, LifetimeTotals>,
+        credentials: &mut HashMap<u64, LifetimeTotals>,
+        mut keep: impl FnMut(&UsageRecord) -> bool,
+    ) -> usize {
+        let before = records.len();
+        records.retain(|record| {
+            if keep(record) {
+                return true;
             }
-            atomic_write(&path, content.as_bytes())?;
-            Ok(())
-        })
-        .await??;
-        Ok(())
+            keys.entry(record.api_key_id)
+                .or_default()
+                .add_record(record);
+            if let Some(id) = record.credential_id {
+                credentials.entry(id).or_default().add_record(record);
+            }
+            false
+        });
+        before - records.len()
     }
 
-    /// 内部真正的异步落地方法
+    fn prune_expired(
+        records: &Arc<RwLock<Vec<UsageRecord>>>,
+        keys: &LifetimeMap<u32>,
+        credentials: &LifetimeMap<u64>,
+        now: DateTime<Utc>,
+    ) -> usize {
+        let cutoff = now - chrono::Duration::days(RETENTION_DAYS);
+        let removed = Self::retain_records(
+            &mut records.write(),
+            &mut keys.write(),
+            &mut credentials.write(),
+            |r| r.created_at >= cutoff,
+        );
+        if removed > 0 {
+            tracing::info!(
+                removed,
+                retention_days = RETENTION_DAYS,
+                "已清理过期用量明细，累计用量保留"
+            );
+        }
+        removed
+    }
+
+    /// 整体原子替换快照；被中断时旧快照仍然完整，未完成临时文件不参与加载。
     async fn save_internal(
         records: &Arc<RwLock<Vec<UsageRecord>>>,
+        keys: &LifetimeMap<u32>,
+        credentials: &LifetimeMap<u64>,
         file_path: &Path,
     ) -> anyhow::Result<()> {
         let content = {
-            let r = records.read();
-            serde_json::to_string(&*r)?
+            let records = records.read();
+            let keys = keys.read();
+            let credentials = credentials.read();
+            serde_json::to_vec(&UsageSnapshot {
+                format_version: 1,
+                records: records.clone(),
+                lifetime_keys: keys.clone(),
+                lifetime_credentials: credentials.clone(),
+            })?
         };
         let path = file_path.to_path_buf();
         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent)?;
             }
-            fs::write(&path, content)?;
+            atomic_write(&path, &content)?;
             Ok(())
         })
         .await??;
@@ -409,70 +435,36 @@ impl UsageTracker {
             let mut records = self.records.write();
             records.push(record);
 
-            // 按 api_key_id 裁剪：保留最新的 MAX_RECORDS_PER_KEY 条
-            let key_count = records
+            let mut keys = self.lifetime_keys.write();
+            let mut credentials = self.lifetime_credentials.write();
+            // 数量上限与时间上限共用补偿逻辑，任何维度裁剪都保留累计与额度。
+            let mut excess = records
                 .iter()
                 .filter(|r| r.api_key_id == api_key_id)
-                .count();
-            if key_count > MAX_RECORDS_PER_KEY {
-                let excess = key_count - MAX_RECORDS_PER_KEY;
-                let mut removed = 0;
-                let mut pruned = LifetimeTotals::default();
-                records.retain(|r| {
-                    if r.api_key_id == api_key_id && removed < excess {
-                        removed += 1;
-                        pruned.pruned_requests += 1;
-                        pruned.pruned_input_tokens += r.input_tokens as i64;
-                        pruned.pruned_output_tokens += r.output_tokens as i64;
+                .count()
+                .saturating_sub(MAX_RECORDS_PER_KEY);
+            Self::retain_records(&mut records, &mut keys, &mut credentials, |r| {
+                if r.api_key_id == api_key_id && excess > 0 {
+                    excess -= 1;
+                    false
+                } else {
+                    true
+                }
+            });
+            if let Some(cid) = credential_id {
+                let mut excess = records
+                    .iter()
+                    .filter(|r| r.credential_id == Some(cid))
+                    .count()
+                    .saturating_sub(MAX_RECORDS_PER_KEY);
+                Self::retain_records(&mut records, &mut keys, &mut credentials, |r| {
+                    if r.credential_id == Some(cid) && excess > 0 {
+                        excess -= 1;
                         false
                     } else {
                         true
                     }
                 });
-                *self.lifetime_keys.write().entry(api_key_id).or_default() += pruned;
-                self.lifetime_dirty.store(true, Ordering::Relaxed);
-            }
-
-            // 按 credential_id 裁剪
-            if let Some(cid) = credential_id {
-                let cred_count = records
-                    .iter()
-                    .filter(|r| r.credential_id == Some(cid))
-                    .count();
-                if cred_count > MAX_RECORDS_PER_KEY {
-                    let excess = cred_count - MAX_RECORDS_PER_KEY;
-                    let mut removed = 0;
-                    // credential 维度裁剪删掉的记录可能属于其他 api_key_id，
-                    // 需按记录各自的 api_key_id 分桶补偿 key 侧基数，
-                    // 否则对应 key 的请求数会因记录消失而倒退
-                    let mut by_key: HashMap<u32, LifetimeTotals> = HashMap::new();
-                    records.retain(|r| {
-                        if r.credential_id == Some(cid) && removed < excess {
-                            removed += 1;
-                            let e = by_key.entry(r.api_key_id).or_default();
-                            e.pruned_requests += 1;
-                            e.pruned_input_tokens += r.input_tokens as i64;
-                            e.pruned_output_tokens += r.output_tokens as i64;
-                            false
-                        } else {
-                            true
-                        }
-                    });
-                    {
-                        // credential 侧基数 = 各 key 分桶贡献之和（仅内存态）
-                        let mut cred = LifetimeTotals::default();
-                        let mut keys = self.lifetime_keys.write();
-                        for (id, v) in by_key {
-                            cred.pruned_requests += v.pruned_requests;
-                            cred.pruned_input_tokens += v.pruned_input_tokens;
-                            cred.pruned_output_tokens += v.pruned_output_tokens;
-                            *keys.entry(id).or_default() += v;
-                        }
-                        drop(keys);
-                        *self.lifetime_credentials.write().entry(cid).or_default() += cred;
-                    }
-                    self.lifetime_dirty.store(true, Ordering::Relaxed);
-                }
             }
         }
         let _ = self.dirty_tx.send(());
@@ -519,21 +511,38 @@ impl UsageTracker {
             })
             .sum();
 
+        let lifetime = self
+            .lifetime_keys
+            .read()
+            .get(&api_key_id)
+            .cloned()
+            .unwrap_or_default();
+        for model in lifetime.by_model.values() {
+            let entry = by_model.entry(model.model.clone()).or_default();
+            entry.0 += model.requests;
+            entry.1 += model.input_tokens;
+            entry.2 += model.output_tokens;
+            entry.3 += model.cost;
+            entry.4 += model.credits;
+            entry.5 += model.credits_saved;
+        }
         UsageSummary {
             api_key_id,
-            // 基数（已裁剪部分）+ 现存明细求和 = 真实累计请求数；
-            // 不加基数会导致超过 MAX_RECORDS_PER_KEY 后请求数封顶不再增长
-            total_requests: self
-                .lifetime_keys
-                .read()
-                .get(&api_key_id)
-                .map_or(0, |t| t.pruned_requests)
-                + filtered.len() as u64,
-            total_input_tokens: filtered.iter().map(|r| r.input_tokens as i64).sum(),
-            total_output_tokens: filtered.iter().map(|r| r.output_tokens as i64).sum(),
-            total_cost: filtered.iter().map(|r| r.estimated_cost).sum(),
-            total_credits,
-            total_credits_saved,
+            total_requests: lifetime.pruned_requests + filtered.len() as u64,
+            total_input_tokens: lifetime.pruned_input_tokens
+                + filtered
+                    .iter()
+                    .map(|r| i64::from(r.input_tokens))
+                    .sum::<i64>(),
+            total_output_tokens: lifetime.pruned_output_tokens
+                + filtered
+                    .iter()
+                    .map(|r| i64::from(r.output_tokens))
+                    .sum::<i64>(),
+            total_cost: lifetime.pruned_cost
+                + filtered.iter().map(|r| r.estimated_cost).sum::<f64>(),
+            total_credits: lifetime.pruned_credits + total_credits,
+            total_credits_saved: lifetime.pruned_credits_saved + total_credits_saved,
             by_model: by_model
                 .into_iter()
                 .map(
@@ -578,6 +587,7 @@ impl UsageTracker {
             .read()
             .iter()
             .map(|r| r.api_key_id)
+            .chain(self.lifetime_keys.read().keys().copied())
             .max()
             .unwrap_or(0)
     }
@@ -591,7 +601,6 @@ impl UsageTracker {
         // 基数同步清零，否则重置后请求数会直接回到重置前的累计值
         self.lifetime_keys.write().remove(&api_key_id);
         drop(records);
-        self.lifetime_dirty.store(true, Ordering::Relaxed);
         let _ = self.dirty_tx.send(());
         Ok(())
     }
@@ -603,7 +612,12 @@ impl UsageTracker {
             .iter()
             .filter(|r| r.api_key_id == api_key_id)
             .map(|r| r.estimated_cost)
-            .sum()
+            .sum::<f64>()
+            + self
+                .lifetime_keys
+                .read()
+                .get(&api_key_id)
+                .map_or(0.0, |t| t.pruned_cost)
     }
 
     /// 获取指定 API Key 的累计真实 credits 消耗（轻量版）
@@ -617,7 +631,12 @@ impl UsageTracker {
                 r.credits_used
                     .unwrap_or_else(|| r.estimated_cost * get_k_ref(&r.model))
             })
-            .sum()
+            .sum::<f64>()
+            + self
+                .lifetime_keys
+                .read()
+                .get(&api_key_id)
+                .map_or(0.0, |t| t.pruned_credits)
     }
 }
 
@@ -627,6 +646,10 @@ mod pricing;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[path = "../../../tests/usage/retention.rs"]
+mod retention_tests;
 
 #[allow(unused_imports)] // 类型归属 daily.rs，经 mod 再导出保持原模块路径
 pub(crate) use daily::{CredentialDaySummary, CredentialRangeSummary, DailySummary};

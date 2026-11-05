@@ -1,6 +1,6 @@
 [package]
 name = "kiro2cc-proxy"
-version = "3.5.1-astra.1"
+version = "3.5.1-astra.2"
 edition = "2024"
 license = "MIT"
 authors = ["Harllan He"]
@@ -38,3 +38,6 @@ mime_guess = "2"      # MIME 类型推断
 dirs = "5"            # 跨平台获取用户目录
 ip2region = "0.1.0"
 tiktoken-rs = "0.12.0"  # BPE token 估算（cl100k_base）
+
+[dev-dependencies]
+tokio = { version = "1.0", features = ["test-util"] }
